@@ -1,0 +1,433 @@
+import os
+import pandas as pd
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from multiprocessing.spawn import spawn_main
+from sklearn.metrics import confusion_matrix, classification_report, f1_score, precision_score, recall_score
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# CONFIGURATION
+
+PARQUET_PATH = "gzd5_small.parquet"
+IMAGE_ROOT = "/Users/nataliapaunova/MSP/BTR/BTR code" # root directory that relative image paths are relative to
+IMAGE_COL = "image_path" # column name containing relative image paths
+BATCH_SIZE = 32 # batch size for training
+NUM_EPOCHS = 200
+LR = 1e-4 # learning rate
+IMG_SIZE = 224 # target image size (224x224)
+NUM_WORKERS = 0 # number of workers for data loading, how many subprocesses should be used to load data, 
+                # = 0 means data will be loaded in the main process, > 0 means that many subprocesses will be used to load data in parallel
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+TARGET_COLS = [
+    "smooth-or-featured_smooth_fraction",
+    "smooth-or-featured_featured-or-disk_fraction",
+    "smooth-or-featured_artifact_fraction",
+    "how-rounded_round_fraction",
+    "how-rounded_in-between_fraction",
+    "disk-edge-on_yes_fraction",
+    "bar_strong_fraction",
+    "bar_weak_fraction",
+    "has-spiral-arms_yes_fraction",
+]
+
+NUM_TARGETS = len(TARGET_COLS) # 9
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# DATASET
+
+class GalaxyDataset(Dataset): #create dataset class
+    def __init__(self, df, image_root, image_col, target_cols, transform=None): #initialize dataset
+        self.df = df.reset_index(drop=True) #reset index of dataframe
+        self.image_root = image_root 
+        self.image_col = image_col
+        self.target_cols = target_cols
+        self.transform = transform
+
+    def __len__(self): #return number of samples in dataset, needed for PyTorch to know how many batches there are per epoch
+        return len(self.df)
+
+    def __getitem__(self, idx): #get item at index idx
+        row = self.df.iloc[idx] #get row at index idx
+        img_path = os.path.join(self.image_root, row[self.image_col]) #construct full image path
+        image = Image.open(img_path) #open image, don't convert to RGB bc image is alreayd in that format
+
+        if self.transform:
+            image = self.transform(image) #apply transformations to image
+
+        targets = torch.tensor(row[self.target_cols].values.astype(np.float32)) #get target values and convert to tensor
+        return image, targets
+
+def split_dataset(df, train_frac=0.8, val_frac=0.1, test_frac=0.1, seed=42):
+    assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-6 #fractions must sum to 1
+
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True) #shuffle dataframe and reset index so it doesn't go linearly
+
+    n = len(df)
+    train_end = int(train_frac * n) #end index for train
+    val_end = train_end + int(val_frac * n) #end index for val
+
+    train_df = df.iloc[:train_end] #train = start to train_end
+    val_df = df.iloc[train_end:val_end] #val = train_end to val_end
+    test_df = df.iloc[val_end:] #test = val_end to end
+
+    return train_df, val_df, test_df
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# TRANSFORMS
+# augmentation for training: random flips and rotations to increase diversity and help model generalize better
+
+train_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),  # RGB → 1 channel, using luminance weights (0.299, 0.587, 0.114) — torchvision does this by default
+    transforms.CenterCrop(180),   # crop 180×180 from center point
+    transforms.Resize((128, 128)),  # downscale
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(180),
+    transforms.ToTensor(), # converts [0, 255] → [0, 1] automatically  
+    #transforms.Normalize(mean=[0.5], std=[0.25])   #accuracy goes down by 15% when I add this, maybe because the images are already pretty normalized since they're mostly black with some bright spots, so scaling and shifting messes with that? would need to experiment more to be sure    
+])
+
+val_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.CenterCrop(180),
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+])
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+# MODEL
+
+class ConvBlock(nn.Module): # conv block = conv → batchnorm → relu → maxpool
+    def __init__(self, in_channels, out_channels): #initialize conv block
+        super().__init__() # call parent constructor
+        self.block = nn.Sequential( # sequential container for layers
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1), # conv layer with 3x3 kernel and padding of 1 to preserve spatial dimensions
+            nn.BatchNorm2d(out_channels), # batch normalization to stabilize training and improve convergence
+            nn.ReLU(inplace=True), # ReLU activation, inplace just saves memory
+            nn.MaxPool2d(2, 2), # max pooling with 2x2 kernel, halves hight and width
+        )
+
+    def forward(self, x): # forward pass through conv block, same as call() in Keras
+        return self.block(x) #apply sequential layers to input x
+
+
+class GalaxyCNN(nn.Module): # CNN model for galaxy classification
+    def __init__(self, num_targets): #initialize model with number of target outputs
+        super().__init__()
+        self.features = nn.Sequential( # stack of conv blocks to extract features from input images
+            ConvBlock(1, 64), # input 1 output 64 channels
+            ConvBlock(64, 128),
+            ConvBlock(128, 256),   
+            ConvBlock(256, 512), # final output is 512 channels with spatial dimensions 14×14 (after 4 rounds of 2x2 pooling from 64x64 input
+        )
+        self.gap = nn.AdaptiveAvgPool2d(1) # GAP to reduce spatial dimensions to 1x1, resulting in a 512-dimensional feature vector for each image
+        self.head = nn.Sequential( # fully connected layers to map features to target outputs, dense layer in Keras
+            nn.Dropout(0.4), # 40% dropout to prevent overfitting
+            nn.Linear(512, 128), # fully connected layer from 512 features to 128 hidden units
+            nn.ReLU(inplace=True), 
+            nn.Linear(128, num_targets), # fully connected layer from 128 hidden units to num_targets outputs
+            nn.Sigmoid(), # sigmoid activation to output probabilities between 0 and 1 for each target class
+        )
+
+    def forward(self, x): # forward pass through the model
+        x = self.features(x) # extract features using conv blocks
+        x = self.gap(x) # apply GAP to reduce spatial dimensions to 1x1
+        x = x.flatten(1)  # (batch, nb of channels)
+        return self.head(x)
+   
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# TRAINING & VALIDATION LOOPS
+# training = look at data, measure error and adjust, validation = look at data and measure error but don't adjust
+# reminder ! loader is how many steps per epoch, not how many batches total, the batch size is images per steps
+def train_epoch(model, loader, optimizer, criterion): # function that runs one full training epoch
+    model.train() # Puts model in training mode, which enables behaviors like dropout and batch normalization that are specific to training
+    total_loss = 0.0 # cumulative loss for the epoch, keeps track of sum of losses over the whole epoch
+    for i, (images, targets) in enumerate(loader): # Loop over batches, i is batch index, images = batch inputs, targets = batch labels     
+        images, targets = images.to(DEVICE), targets.to(DEVICE) # move to cpu
+        optimizer.zero_grad() # 0 out gradients from previous step
+        preds = model(images) # predictions from the model are the model applied to the images
+        loss = criterion(preds, targets) # computes how wrong predictions are
+        loss.backward() # backpropagation
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient clipping to prevent exploding gradients, if gradient norm > 1 → scale it down
+        optimizer.step() # Updates model weights using gradients
+        if torch.isnan(targets).any():
+            print("NaN in targets")
+        total_loss += loss.item() * len(images) # compute total loss
+        if torch.isnan(loss): # trying to debug
+            print("NaN loss detected")
+            print("Preds min/max:", preds.min().item(), preds.max().item())
+            print("Targets min/max:", targets.min().item(), targets.max().item())
+    return total_loss / len(loader.dataset)
+
+
+def val_epoch(model, loader, criterion):
+    model.eval()
+    total_loss = 0.0
+
+    with torch.no_grad():
+        for images, targets in loader:
+            images, targets = images.to(DEVICE), targets.to(DEVICE)
+            preds = model(images)
+            loss = criterion(preds, targets)
+
+            total_loss += loss.item() * len(images)
+
+    return total_loss / len(loader.dataset)
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# CLASSIFIER
+
+def classify_galaxy(row, t_main=0.5, t_rare=0.35, min_confidence=0.2):
+    smooth = row['smooth-or-featured_smooth_fraction']
+    featured = row['smooth-or-featured_featured-or-disk_fraction']
+    artifact = row['smooth-or-featured_artifact_fraction']
+    elliptical = row['how-rounded_round_fraction'] + row['how-rounded_in-between_fraction']
+    edge_on = row['disk-edge-on_yes_fraction']
+    spiral = row['has-spiral-arms_yes_fraction']
+    bar_total = row['bar_strong_fraction'] + row['bar_weak_fraction']
+
+    # only classify if top class is clearly dominant
+    top_two = sorted([smooth, featured, artifact], reverse=True)
+    if top_two[0] - top_two[1] < min_confidence:
+        return 'other'  # too ambiguous
+
+    if artifact > t_main:
+        return 'other'
+    if smooth > t_main:
+        if elliptical > t_main:
+            return 'elliptical'
+        return 'other'
+    if featured > t_main:
+        if bar_total > t_rare:
+            return 'barred spiral'
+        if spiral > t_rare or edge_on > t_rare:
+            return 'spiral'
+        return 'other'
+    return 'other'
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# EVALUATION: compare predicted vs ground-truth labels
+
+def evaluate_labels(model, loader):
+    model.eval()
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(DEVICE)
+            preds = model(images).cpu().numpy()
+            all_preds.append(preds)
+            all_targets.append(targets.numpy())
+
+    # Concatenate batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    # Convert to DataFrames
+    pred_df = pd.DataFrame(all_preds, columns=TARGET_COLS)
+    target_df = pd.DataFrame(all_targets, columns=TARGET_COLS)
+
+    # Use classifier
+    pred_labels = pred_df.apply(classify_galaxy, axis=1)
+    target_labels = target_df.apply(classify_galaxy, axis=1)
+
+    # Overall accuracy
+    # percentage of validation galaxies where the predicted label matches the true label, 
+    # both derived by running fractions through classify_galaxy
+    accuracy = (pred_labels == target_labels).mean() 
+
+    # Per-class accuracy, new
+    # same but broken down per class (elliptical, spiral, barred spiral, other). Tells you which classes the model struggles with.
+    class_accuracy = {}
+    for cls in target_labels.unique():
+        mask = target_labels == cls
+        if mask.sum() > 0:
+            class_accuracy[cls] = (pred_labels[mask] == cls).mean()
+
+    # Distribution (useful for debugging), new
+    pred_dist = pred_labels.value_counts(normalize=True) # what classes your model actually predicts, if this looks very different from target_dist, the model is biased toward certain classes
+    target_dist = target_labels.value_counts(normalize=True) # true class distribution in your validation set
+
+    type_order = ['elliptical', 'spiral', 'barred spiral', 'other']
+
+    cm = confusion_matrix(target_labels, pred_labels, labels=type_order)
+    report = classification_report(target_labels, pred_labels, labels=type_order)
+
+    f1 = f1_score(target_labels, pred_labels, labels=type_order, average='weighted') # weighted = each class's score is weighted by how many examples it has 
+    precision = precision_score(target_labels, pred_labels, labels=type_order, average='weighted')
+    recall = recall_score(target_labels, pred_labels, labels=type_order, average='weighted')
+
+    return {
+        "Overall accuracy": accuracy,
+        "Accuracy per class": class_accuracy,
+        "Predicted distribution": pred_dist,
+        "True distribution": target_dist,
+        "Predicted labels": pred_labels,
+        "True labels": target_labels,
+        "Confusion matrix": cm,
+        "Classification report": report,
+        "F1 score": f1,
+        "Precision": precision,
+        "Recall": recall,
+    }
+
+def plot_confusion_matrix(cm, labels):
+    fig, ax = plt.subplots(figsize=(6, 5)) # creates a 6x5 inch figure
+    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues) # draws the matrix as a heatmap, darker blue = higher number
+    plt.colorbar(im, ax=ax) # adds the color scale bar on the right
+
+    ax.set(
+        xticks=np.arange(len(labels)), # where to put x ticks marks
+        yticks=np.arange(len(labels)), # where to put y ticks marks
+        xticklabels=labels, # label each column with class name
+        yticklabels=labels, # label each row with class name
+        xlabel='Predicted label',
+        ylabel='True label',
+        title='Confusion Matrix'
+    )
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor') # rotates x labels 45 degrees so they don't overlap
+
+    # annotate each cell with the count
+    thresh = cm.max() / 2.0
+    # halfway point between 0 and the highest count in the matrix
+    # used to decide whether to write numbers in white or black
+    for i in range(len(labels)): # loop over rows (true classes)
+        for j in range(len(labels)): # loop over columns (predicted classes)
+            ax.text(j, i, format(cm[i, j], 'd'), # write the count as an integer
+                    ha='center', va='center', # center the text in the cell
+                    color='white' if cm[i, j] > thresh else 'black') # white text on dark blue cells, black text on light cells so the number is always readable
+
+    fig.tight_layout()  # prevents labels from being cut off at the edges
+    plt.show()
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# MAIN
+
+def main():
+    # Load parquet
+    print(f"\nLoading data from {PARQUET_PATH}...")
+    df = pd.read_parquet(PARQUET_PATH)
+    n_before = len(df)
+    print(f"Before NaN removal: {n_before}")
+    df[TARGET_COLS] = df[TARGET_COLS].fillna(0)
+    labels = df[TARGET_COLS].apply(classify_galaxy, axis=1) 
+    print("\nFull dataset class distribution:")
+    print(labels.value_counts(normalize=True))
+
+    train_df, val_df, test_df = split_dataset(df)
+    train_ds = GalaxyDataset(train_df, IMAGE_ROOT, IMAGE_COL, TARGET_COLS, train_transform) #dataset for training
+    val_ds = GalaxyDataset(val_df, IMAGE_ROOT, IMAGE_COL, TARGET_COLS, val_transform) #dataset for validation, no augmentation
+    test_ds = GalaxyDataset(test_df, IMAGE_ROOT, IMAGE_COL, TARGET_COLS, val_transform) #dataset for testing, no augmentation
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=False)
+    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=False)
+    
+    print(f"Train: {len(train_df)}")
+    print(f"Validation: {len(val_df)}")
+    print(f"Test: {len(test_df)}")
+
+    # Model, loss, optimizer
+    model = GalaxyCNN(NUM_TARGETS).to(DEVICE)
+    criterion = nn.MSELoss() # regression loss for fraction targets
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, patience=5, factor=0.3, min_lr=1e-6)
+
+    print(f"Training on {DEVICE} — {len(train_ds)} training / {len(val_ds)} validation")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+
+    best_val_loss = float("inf")
+
+    train_losses = []
+    val_losses = []
+    val_accuracies = []
+
+    for epoch in range(1, NUM_EPOCHS + 1):
+        train_loss = train_epoch(model, train_loader, optimizer, criterion)
+        val_loss = val_epoch(model, val_loader, criterion)
+        scheduler.step(val_loss)
+        #val_accuracy, _, _ = evaluate_labels(model, val_loader)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "best_galaxy_cnn.pt")
+
+        if epoch % 10 == 0:
+            try:
+                metrics = evaluate_labels(model, val_loader)
+                val_accuracies.append((epoch, metrics["Overall accuracy"]))
+                print(f"EPOCH {epoch:>3}/{NUM_EPOCHS}: "
+                    f"TRAIN LOSS = {train_loss:.4f}, VAL LOSS = {val_loss:.4f}, "
+                    f"ACCURACY = {metrics['Overall accuracy']:.2%}")
+            except Exception as e:
+                print(f"evaluate_labels failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+    print("\nLoading best model for final evaluation...")
+    model.load_state_dict(torch.load("best_galaxy_cnn.pt"))
+    metrics = evaluate_labels(model, val_loader)
+    plot_confusion_matrix(metrics["Confusion matrix"], ['elliptical', 'spiral', 'barred spiral', 'other'])
+
+    print(f"\nFinal accuracy: {metrics['Overall accuracy']:.2%}")
+    print(f"F1 score: {metrics['F1 score']:.4f}")
+    print(f"Precision: {metrics['Precision']:.4f}")
+    print(f"Recall: {metrics['Recall']:.4f}")
+    print("\nPer-class accuracy:")
+    for cls, acc in metrics["Accuracy per class"].items():
+        print(f"  {cls}: {acc:.2%}")
+    print("\nClassification report:")
+    print(metrics["Classification report"])
+    print("\nConfusion matrix:")
+    print(metrics["Confusion matrix"])
+    print("\nTrue distribution:")
+    print(metrics["True distribution"])
+    print("\nPredicted distribution:")
+    print(metrics["Predicted distribution"])
+
+    epochs = range(1, NUM_EPOCHS + 1)
+
+    plt.figure()
+    plt.plot(epochs, train_losses, label="Train Loss")
+    plt.plot(epochs, val_losses, label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training vs Validation Loss")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    acc_epochs, acc_values = zip(*val_accuracies)
+    plt.figure()
+    plt.plot(acc_epochs, acc_values, label="Validation Accuracy", marker='o')
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Validation Accuracy Over Time")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
