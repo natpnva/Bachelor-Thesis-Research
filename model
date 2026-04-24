@@ -9,28 +9,33 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from multiprocessing.spawn import spawn_main
 from sklearn.metrics import confusion_matrix, classification_report, f1_score, precision_score, recall_score
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 # -------------------------------------------------------------------------------------------------------------------------------------
 
 # CONFIGURATION
 
-PARQUET_PATH = "gzd5_small.parquet"
-IMAGE_ROOT = "/Users/nataliapaunova/MSP/BTR/BTR code" # root directory that relative image paths are relative to
+PARQUET_PATH = "/home/coder/project/gzd5_matched.parquet"
+IMAGE_ROOT = "/tmp/images_flat/images_flat" # root directory that relative image paths are relative to
 IMAGE_COL = "image_path" # column name containing relative image paths
 BATCH_SIZE = 32 # batch size for training
-NUM_EPOCHS = 200
-LR = 1e-4 # learning rate
+NUM_EPOCHS = 100
+LR = 2e-4 # learning rate
 IMG_SIZE = 224 # target image size (224x224)
 NUM_WORKERS = 0 # number of workers for data loading, how many subprocesses should be used to load data, 
                 # = 0 means data will be loaded in the main process, > 0 means that many subprocesses will be used to load data in parallel
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else
+    "cpu"
+)
 TARGET_COLS = [
     "smooth-or-featured_smooth_fraction",
     "smooth-or-featured_featured-or-disk_fraction",
     "smooth-or-featured_artifact_fraction",
     "how-rounded_round_fraction",
     "how-rounded_in-between_fraction",
+    "how-rounded_cigar-shaped_fraction",
     "disk-edge-on_yes_fraction",
     "bar_strong_fraction",
     "bar_weak_fraction",
@@ -64,6 +69,7 @@ class GalaxyDataset(Dataset): #create dataset class
 
         targets = torch.tensor(row[self.target_cols].values.astype(np.float32)) #get target values and convert to tensor
         return image, targets
+
 
 def split_dataset(df, train_frac=0.8, val_frac=0.1, test_frac=0.1, seed=42):
     assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-6 #fractions must sum to 1
@@ -143,7 +149,23 @@ class GalaxyCNN(nn.Module): # CNN model for galaxy classification
         x = self.gap(x) # apply GAP to reduce spatial dimensions to 1x1
         x = x.flatten(1)  # (batch, nb of channels)
         return self.head(x)
-   
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+
+# WEIGHTS
+
+def make_weighted_sampler(df):
+    labels = df[TARGET_COLS].apply(classify_galaxy, axis=1)
+    class_counts = labels.value_counts()
+    # weight per class = 1 / count (rarer classes get higher weight)
+    class_weights = 1.0 / class_counts
+    # assign each sample its class weight
+    sample_weights = labels.map(class_weights).values
+    return WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float),
+        num_samples=len(sample_weights),
+        replacement=True
+    )
 # -------------------------------------------------------------------------------------------------------------------------------------
 
 # TRAINING & VALIDATION LOOPS
@@ -192,7 +214,7 @@ def classify_galaxy(row, t_main=0.5, t_rare=0.35, min_confidence=0.2):
     smooth = row['smooth-or-featured_smooth_fraction']
     featured = row['smooth-or-featured_featured-or-disk_fraction']
     artifact = row['smooth-or-featured_artifact_fraction']
-    elliptical = row['how-rounded_round_fraction'] + row['how-rounded_in-between_fraction']
+    #elliptical = row['how-rounded_round_fraction'] + row['how-rounded_in-between_fraction'] + row['how-rounded_cigar-shaped_fraction']
     edge_on = row['disk-edge-on_yes_fraction']
     spiral = row['has-spiral-arms_yes_fraction']
     bar_total = row['bar_strong_fraction'] + row['bar_weak_fraction']
@@ -205,16 +227,66 @@ def classify_galaxy(row, t_main=0.5, t_rare=0.35, min_confidence=0.2):
     if artifact > t_main:
         return 'other'
     if smooth > t_main:
-        if elliptical > t_main:
-            return 'elliptical'
-        return 'other'
+        return 'elliptical'
     if featured > t_main:
-        if bar_total > t_rare:
+        if edge_on > t_main:
+            return 'spiral'
+        if bar_total > t_main:
             return 'barred spiral'
-        if spiral > t_rare or edge_on > t_rare:
+        if spiral > t_main:
             return 'spiral'
         return 'other'
     return 'other'
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+# TREE AWARE LOSS
+
+def tree_aware_loss(preds, targets):
+    """
+    MSE loss weighted by how many votes actually reached each question.
+    Questions deeper in the tree are downweighted when their parent branch
+    had low support (e.g. disk-edge-on is downweighted for smooth galaxies).
+
+    Tree structure:
+        smooth-or-featured (always asked)
+            └── how-rounded        (if smooth)
+            └── disk-edge-on       (if featured)
+                └── bar            (if featured & not edge-on)
+                └── has-spiral-arms (if featured & not edge-on)
+    """
+    # --- extract parent fractions from TARGETS (not predictions) ---
+    # using targets as weights means: "how much did this question actually matter for this galaxy, according to volunteers?"
+    smooth   = targets[:, 0]  # smooth-or-featured_smooth_fraction
+    featured = targets[:, 1]  # smooth-or-featured_featured-or-disk_fraction
+    # not-edge-on proxy: featured galaxies that volunteers didn't call edge-on
+    not_edge_on = featured * (1.0 - targets[:, 6])  # disk-edge-on_yes_fraction
+
+    # --- weight per question group ---
+    # shape: (batch,) for each, then unsqueeze to broadcast over answers
+    w_top      = torch.ones(len(targets), device=targets.device)  # always asked
+    w_rounded  = smooth      # how-rounded: only if smooth
+    w_edge_on  = featured    # disk-edge-on: only if featured
+    w_bar      = not_edge_on # bar: only if featured & not edge-on
+    w_spiral   = not_edge_on # has-spiral-arms: same branch as bar
+
+    # stack weights to match TARGET_COLS order:
+    # [smooth/featured/artifact, round/inbetween/cigar, edge-on, bar_strong/weak, spiral]
+    weights = torch.stack([
+        w_top,      # smooth-or-featured_smooth_fraction
+        w_top,      # smooth-or-featured_featured-or-disk_fraction
+        w_top,      # smooth-or-featured_artifact_fraction
+        w_rounded,  # how-rounded_round_fraction
+        w_rounded,  # how-rounded_in-between_fraction
+        w_rounded,  # how-rounded_cigar-shaped_fraction
+        w_edge_on,  # disk-edge-on_yes_fraction
+        w_bar,      # bar_strong_fraction
+        w_bar,      # bar_weak_fraction
+        w_spiral,   # has-spiral-arms_yes_fraction
+    ], dim=1)  # shape: (batch, 10)
+
+    sq_errors = (preds - targets) ** 2          # (batch, 10)
+    weighted  = sq_errors * weights             # downweight irrelevant questions
+    return weighted.mean()
 
 # -------------------------------------------------------------------------------------------------------------------------------------
 
@@ -248,7 +320,7 @@ def evaluate_labels(model, loader):
     # Overall accuracy
     # percentage of validation galaxies where the predicted label matches the true label, 
     # both derived by running fractions through classify_galaxy
-    accuracy = (pred_labels == target_labels).mean() 
+    accuracy = (pred_labels == target_labels).mean()
 
     # Per-class accuracy, new
     # same but broken down per class (elliptical, spiral, barred spiral, other). Tells you which classes the model struggles with.
@@ -314,6 +386,7 @@ def plot_confusion_matrix(cm, labels):
 
     fig.tight_layout()  # prevents labels from being cut off at the edges
     plt.show()
+    plt.savefig('/home/coder/project/confusion_matrix_test.png')
 
 # -------------------------------------------------------------------------------------------------------------------------------------
 
@@ -324,8 +397,9 @@ def main():
     print(f"\nLoading data from {PARQUET_PATH}...")
     df = pd.read_parquet(PARQUET_PATH)
     n_before = len(df)
-    print(f"Before NaN removal: {n_before}")
+    print(f"Loaded: {n_before}")
     df[TARGET_COLS] = df[TARGET_COLS].fillna(0)
+    df[IMAGE_COL] = df[IMAGE_COL].apply(lambda x: os.path.basename(x)) # this is not on vscode it's so the cnn knows to look the images à partir du new path
     labels = df[TARGET_COLS].apply(classify_galaxy, axis=1) 
     print("\nFull dataset class distribution:")
     print(labels.value_counts(normalize=True))
@@ -335,8 +409,9 @@ def main():
     val_ds = GalaxyDataset(val_df, IMAGE_ROOT, IMAGE_COL, TARGET_COLS, val_transform) #dataset for validation, no augmentation
     test_ds = GalaxyDataset(test_df, IMAGE_ROOT, IMAGE_COL, TARGET_COLS, val_transform) #dataset for testing, no augmentation
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=False)
+    sampler = make_weighted_sampler(train_df)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,  # remove shuffle=True
+                          num_workers=NUM_WORKERS, pin_memory=False)
     val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=False)
     
@@ -346,7 +421,7 @@ def main():
 
     # Model, loss, optimizer
     model = GalaxyCNN(NUM_TARGETS).to(DEVICE)
-    criterion = nn.MSELoss() # regression loss for fraction targets
+    criterion = tree_aware_loss 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer, patience=5, factor=0.3, min_lr=1e-6)
@@ -373,7 +448,7 @@ def main():
             best_val_loss = val_loss
             torch.save(model.state_dict(), "best_galaxy_cnn.pt")
 
-        if epoch % 10 == 0:
+        if epoch % 1 == 0:
             try:
                 metrics = evaluate_labels(model, val_loader)
                 val_accuracies.append((epoch, metrics["Overall accuracy"]))
@@ -417,16 +492,18 @@ def main():
     plt.legend()
     plt.grid()
     plt.show()
+    plt.savefig('/home/coder/project/training_validation_loss.png')
 
     acc_epochs, acc_values = zip(*val_accuracies)
     plt.figure()
     plt.plot(acc_epochs, acc_values, label="Validation Accuracy", marker='o')
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
-    plt.title("Validation Accuracy Over Time")
+    plt.title("Validation Accuracy")
     plt.legend()
     plt.grid()
     plt.show()
+    plt.savefig('/home/coder/project/validation_accuracy.png')
 
 
 if __name__ == "__main__":
