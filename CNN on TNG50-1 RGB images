@@ -1,0 +1,270 @@
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+from PIL import Image
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from astropy.io import fits
+import cv2
+
+# ----------------------------------------------------------------
+# FITS → RGB CONVERSION (GZD‑5 STYLE)
+# Implements the 2.3 pipeline from Walmsley et al. (2022)
+
+def fits_to_pil_gzd5(fits_path):
+    """Convert a 4‑band GZD‑5 FITS file into an RGB PIL image."""
+    try:
+        with fits.open(fits_path) as hdul:
+            data = hdul[0].data  # shape: (4, H, W)
+
+        # g=0, r=1, i=2, z=3  → use g,r,z for RGB
+        g = data[0].astype(np.float64)
+        r = data[1].astype(np.float64)
+        z = data[3].astype(np.float64)
+
+        # Step 1: flux scaling (Lupton convention)
+        r_ch = z * 52.63
+        g_ch = r * 71.43
+        b_ch = g * 125.0
+        rgb = np.stack([r_ch, g_ch, b_ch], axis=-1)
+
+        # Step 2: saturation reduction for low‑flux pixels
+        T = 90.0
+        lam_nm = 600.0
+        mean_flux = rgb.mean(axis=-1, keepdims=True)
+        N_proxy = np.abs(mean_flux) * T / lam_nm
+        alpha = np.minimum(0.01 * np.sqrt(np.maximum(N_proxy, 0)), 1.0)
+        rgb = mean_flux + alpha * (rgb - mean_flux)
+
+        # Step 3: arcsinh stretch
+        rgb = np.arcsinh(rgb)
+
+        # Step 4: linear stretch to 0–255 using actual data range
+        rgb_min = rgb.min()
+        rgb_max = np.percentile(rgb, 99.5)
+        rgb = (rgb - rgb_min) / (rgb_max - rgb_min) * 255.0
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+        return Image.fromarray(rgb, mode="RGB")
+
+    except Exception as e:
+        print(f"fits_to_pil_gzd5 failed on {fits_path}: {e}")
+        return None
+
+
+# ----------------------------------------------------------------
+# IMAGE PREPROCESSING
+
+def center_on_brightest(img_pil, margin=0.3):
+    """Crop image around brightest pixel (ignoring edges)."""
+    arr = np.array(img_pil.convert("L"))
+    H, W = arr.shape
+
+    m = int(min(H, W) * margin)
+    interior = arr[m:H-m, m:W-m]
+
+    peak_y, peak_x = np.unravel_index(np.argmax(interior), interior.shape)
+    peak_y += m
+    peak_x += m
+
+    half = min(peak_y, H - peak_y, peak_x, W - peak_x)
+    return img_pil.crop((peak_x - half, peak_y - half, peak_x + half, peak_y + half))
+
+
+def gaussian_noise(img, mean, stddev, gamma=1):
+    """Add Gaussian noise to an image using OpenCV."""
+    gauss = np.zeros(img.shape[:2])
+    cv2.randn(gauss, mean, stddev)
+    gauss = (gauss * gamma).astype(np.uint8)
+
+    if img.ndim == 2:
+        return gauss, cv2.add(img, gauss)
+    else:
+        merged = cv2.merge([gauss, gauss, gauss])
+        return gauss, cv2.add(img, merged)
+
+
+def make_transform():
+    """Standard grayscale → resize → tensor transform."""
+    return transforms.Compose([
+        transforms.Grayscale(num_output_channels=1),
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+    ])
+
+
+# ----------------------------------------------------------------
+# MODEL
+
+class ConvBlock(nn.Module):
+    """Conv → BatchNorm → ReLU → MaxPool block."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class GalaxyCNN(nn.Module):
+    """Simple CNN for predicting 10 Galaxy Zoo vote fractions."""
+    def __init__(self, num_targets):
+        super().__init__()
+        self.features = nn.Sequential(
+            ConvBlock(1, 64),
+            ConvBlock(64, 128),
+            ConvBlock(128, 256),
+            ConvBlock(256, 512),
+        )
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_targets),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.gap(x).flatten(1)
+        return self.head(x)
+
+
+# ----------------------------------------------------------------
+# MORPHOLOGY CLASSIFIER (rule‑based)
+
+def classify_galaxy(row, t_main=0.5, min_confidence=0.2):
+    """Convert predicted vote fractions into a coarse morphology label."""
+    smooth = row["smooth-or-featured_smooth_fraction"]
+    featured = row["smooth-or-featured_featured-or-disk_fraction"]
+    artifact = row["smooth-or-featured_artifact_fraction"]
+    edge_on = row["disk-edge-on_yes_fraction"]
+    spiral = row["has-spiral-arms_yes_fraction"]
+    bar_total = row["bar_strong_fraction"] + row["bar_weak_fraction"]
+
+    # Require clear dominance
+    top_two = sorted([smooth, featured, artifact], reverse=True)
+    if top_two[0] - top_two[1] < min_confidence:
+        return "other"
+
+    if artifact > t_main:
+        return "other"
+    if smooth > t_main:
+        return "elliptical"
+    if featured > t_main:
+        if edge_on > t_main:
+            return "spiral"
+        if bar_total > t_main:
+            return "barred spiral"
+        if spiral > t_main:
+            return "spiral"
+        return "other"
+
+    return "other"
+
+
+# ----------------------------------------------------------------
+# LOAD MODEL
+
+TARGET_COLS = [
+    "smooth-or-featured_smooth_fraction",
+    "smooth-or-featured_featured-or-disk_fraction",
+    "smooth-or-featured_artifact_fraction",
+    "how-rounded_round_fraction",
+    "how-rounded_in-between_fraction",
+    "how-rounded_cigar-shaped_fraction",
+    "disk-edge-on_yes_fraction",
+    "bar_strong_fraction",
+    "bar_weak_fraction",
+    "has-spiral-arms_yes_fraction",
+]
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else
+    "cpu"
+)
+
+model = GalaxyCNN(len(TARGET_COLS)).to(DEVICE)
+model.load_state_dict(torch.load(
+    "/Users/nataliapaunova/MSP/BTR/BTR code/project/best_galaxy_cnn.pt",
+    map_location=DEVICE
+))
+model.eval()
+
+
+# ----------------------------------------------------------------
+# DATA LOADING HELPERS
+
+def load_tng(path):
+    """Load + convert + center + noise‑augment a TNG FITS image."""
+    img = fits_to_pil_gzd5(path)
+    if img is None:
+        return None
+    img = center_on_brightest(img)
+    arr = np.array(img)
+    _, noisy = gaussian_noise(arr, mean=0, stddev=5)
+    return Image.fromarray(noisy)
+
+
+def load_gzd(path):
+    """Load a GZD‑5 JPEG/PNG and apply center crop."""
+    img = Image.open(path)
+    return transforms.CenterCrop(180)(img)
+
+
+def load_image(row):
+    """Dispatch loader based on dataset source."""
+    return load_tng(row["path"]) if row["source"] == "tng" else load_gzd(row["path"])
+
+
+# ----------------------------------------------------------------
+# INFERENCE
+
+DATA_DIR = "/Users/nataliapaunova/MSP/BTR/BTR code/project/sdss/snapnum_099/data/"
+
+tng_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".fits")]
+tng_df = pd.DataFrame({
+    "path": [os.path.join(DATA_DIR, f) for f in tng_files],
+    "id": [int(re.search(r"broadband_(\d+)", f).group(1)) for f in tng_files],
+    "source": "tng"
+})
+
+gzd_files = [
+    "/Users/nataliapaunova/MSP/BTR/BTR code/project/classification_parquets/elliptical.parquet",
+    "/Users/nataliapaunova/MSP/BTR/BTR code/project/classification_parquets/spiral.parquet",
+    "/Users/nataliapaunova/MSP/BTR/BTR code/project/classification_parquets/barred spiral.parquet",
+    "/Users/nataliapaunova/MSP/BTR/BTR code/project/classification_parquets/other.parquet",
+]
+
+gzd_df = pd.concat([pd.read_parquet(f) for f in gzd_files], ignore_index=True)
+gzd_df["source"] = "gzd"
+gzd_df["path"] = gzd_df["full_image_path"]
+
+full_df = pd.concat([tng_df, gzd_df], ignore_index=True)
+
+results = []
+
+with torch.no_grad():
+    for _, row in full_df.iterrows():
+        try:
+            img = load_image(row)
+            if img is None:
+                continue
+
+            tensor = make_transform()(img).unsqueeze(0).to(DEVICE)
+            preds = model(tensor).cpu().numpy()[0]
+            pred_row = dict(zip(TARGET_COLS, preds))
+
+            results.append({
+                "id": row["id"],
