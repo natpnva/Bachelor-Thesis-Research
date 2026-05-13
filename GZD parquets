@@ -1,0 +1,150 @@
+import os
+import pandas as pd
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+# -------------------------------------------------------------------------------------------------------------------------------------
+# CONFIGURATION
+
+# Path to the input parquet file containing galaxy metadata + vote fractions
+PARQUET_PATH = "/Users/nataliapaunova/MSP/BTR/BTR code/project/gzd5_matched.parquet"
+
+# Root directory where all galaxy images are stored
+IMAGE_ROOT = "/Users/nataliapaunova/MSP/BTR/BTR code/project/images"
+
+# Directory where the output parquet files (one per morphology) will be saved
+OUTPUT_DIR = "/Users/nataliapaunova/MSP/BTR/BTR code/project/classification_parquets"
+
+# Column in the parquet file that contains relative image paths
+IMAGE_COL = "image_path"
+
+# Column containing unique galaxy identifiers
+ID_COL = "iauname"
+
+# Training hyperparameters (not used in this script but part of the project config)
+BATCH_SIZE = 32
+NUM_EPOCHS = 100
+LR = 2e-4
+IMG_SIZE = 224
+NUM_WORKERS = 0
+
+# Select device: Apple MPS if available, otherwise CPU
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+# Columns containing Galaxy Zoo vote fractions used for classification
+TARGET_COLS = [
+    "smooth-or-featured_smooth_fraction",
+    "smooth-or-featured_featured-or-disk_fraction",
+    "smooth-or-featured_artifact_fraction",
+    "how-rounded_round_fraction",
+    "how-rounded_in-between_fraction",
+    "how-rounded_cigar-shaped_fraction",
+    "disk-edge-on_yes_fraction",
+    "bar_strong_fraction",
+    "bar_weak_fraction",
+    "has-spiral-arms_yes_fraction",
+]
+
+# Number of target columns
+NUM_TARGETS = len(TARGET_COLS)
+
+
+def classify_galaxy(row, t_main=0.5, t_rare=0.35, min_confidence=0.2):
+    """
+    Classify a galaxy into a coarse morphology class using Galaxy Zoo vote fractions.
+
+    Parameters:
+        row: A pandas Series containing vote fractions for one galaxy.
+        t_main: Threshold for deciding dominant morphology.
+        t_rare: Threshold for rare features (unused here but kept for flexibility).
+        min_confidence: Minimum difference between top two classes to avoid ambiguous labels.
+
+    Returns:
+        A string label: 'elliptical', 'spiral', 'barred spiral', or 'other'.
+    """
+
+    # Extract relevant vote fractions
+    smooth = row['smooth-or-featured_smooth_fraction']
+    featured = row['smooth-or-featured_featured-or-disk_fraction']
+    artifact = row['smooth-or-featured_artifact_fraction']
+    edge_on = row['disk-edge-on_yes_fraction']
+    spiral = row['has-spiral-arms_yes_fraction']
+    bar_total = row['bar_strong_fraction'] + row['bar_weak_fraction']
+
+    # Determine whether the classification is confident enough
+    top_two = sorted([smooth, featured, artifact], reverse=True)
+    if top_two[0] - top_two[1] < min_confidence:
+        return 'other'  # ambiguous → reject
+
+    # Artifact-dominated galaxies are excluded
+    if artifact > t_main:
+        return 'other'
+
+    # Smooth-dominated → elliptical
+    if smooth > t_main:
+        return 'elliptical'
+
+    # Featured/disk-dominated → check substructure
+    if featured > t_main:
+        # Edge-on disk
+        if edge_on > t_main:
+            return 'spiral'
+        # Strong or weak bar → barred spiral
+        if bar_total > t_main:
+            return 'barred spiral'
+        # Spiral arms visible → spiral
+        if spiral > t_main:
+            return 'spiral'
+        # Otherwise ambiguous
+        return 'other'
+
+    # Fallback
+    return 'other'
+
+
+def main():
+    # Ensure output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print(f"\nLoading data from {PARQUET_PATH}...")
+    df = pd.read_parquet(PARQUET_PATH)
+    n_before = len(df)
+    print(f"Loaded: {n_before}")
+
+    # Replace missing vote fractions with zero
+    df[TARGET_COLS] = df[TARGET_COLS].fillna(0)
+
+    # Convert relative image paths → full absolute paths
+    df["full_image_path"] = df[IMAGE_COL].apply(
+        lambda x: os.path.join(IMAGE_ROOT, os.path.basename(x))
+    )
+
+    # Apply morphological classification
+    df["classification"] = df.apply(classify_galaxy, axis=1)
+
+    # Show class distribution
+    print(df["classification"].value_counts())
+
+    # Export one parquet file per morphology class
+    for morphology in ["elliptical", "spiral", "barred spiral", "other"]:
+
+        # Select only ID + image path for this class
+        subset = df[df["classification"] == morphology][[ID_COL, "full_image_path"]]
+
+        # Output file path
+        output_path = os.path.join(OUTPUT_DIR, f"{morphology}.parquet")
+
+        # Save parquet
+        subset.to_parquet(output_path, index=False)
+
+        print(f"Saved {len(subset)} galaxies -> {output_path}")
+
+
+if __name__ == "__main__":
+    main()
