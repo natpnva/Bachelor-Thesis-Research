@@ -1,0 +1,327 @@
+import os
+import pandas as pd
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torchvision import transforms
+import re
+import cv2
+    
+# ----------------------------------------------------------------
+# OG MODEL TRANSFORMS WITHOUT CENTERCROP(180)
+# Converts image → grayscale → resize → tensor for CNN input
+def make_transform():
+    return transforms.Compose([
+        transforms.Grayscale(num_output_channels=1),
+        transforms.Resize((128, 128)),
+        transforms.ToTensor(),
+    ])
+
+# ----------------------------------------------------------------
+# GAUSSIAN NOISE
+# Adds Gaussian noise to an image (used to match training conditions)
+def gaussian_noise(img, mean, stddev, gamma = 1):
+    # Create Gaussian noise matrix
+    gauss_noise = np.zeros(img.shape[:2])
+    cv2.randn(gauss_noise, mean, stddev)
+    gauss_noise = (gauss_noise*gamma).astype(np.uint8)
+    
+    # Add noise to grayscale or RGB image
+    if len(img.shape) == 2:
+        output = cv2.add(img, gauss_noise)
+    elif len(img.shape) == 3:
+        merged = cv2.merge([gauss_noise, gauss_noise, gauss_noise])
+        output = cv2.add(img, merged)
+    return gauss_noise, output
+
+# ----------------------------------------------------------------
+# MODEL
+# Convolutional blocks + fully connected head for predicting 10 GZ vote fractions
+
+class ConvBlock(nn.Module):  # conv block = conv → batchnorm → relu → maxpool
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class GalaxyCNN(nn.Module):  # CNN model for galaxy classification
+    def __init__(self, num_targets):
+        super().__init__()
+        self.features = nn.Sequential(
+            ConvBlock(1, 64),
+            ConvBlock(64, 128),
+            ConvBlock(128, 256),   
+            ConvBlock(256, 512),
+        )
+        self.gap = nn.AdaptiveAvgPool2d(1)  # compress spatial dims → 1×1
+        self.head = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_targets),
+            nn.Sigmoid(),  # output vote fractions in [0,1]
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.gap(x)
+        x = x.flatten(1)
+        return self.head(x)
+
+# ----------------------------------------------------------------
+# CLASSIFIER
+# Converts predicted vote fractions → coarse morphology label
+
+def classify_galaxy(row, t_main=0.5, t_rare=0.35, min_confidence=0.2):
+    smooth = row['smooth-or-featured_smooth_fraction']
+    featured = row['smooth-or-featured_featured-or-disk_fraction']
+    artifact = row['smooth-or-featured_artifact_fraction']
+    edge_on = row['disk-edge-on_yes_fraction']
+    spiral = row['has-spiral-arms_yes_fraction']
+    bar_total = row['bar_strong_fraction'] + row['bar_weak_fraction']
+
+    # Require clear dominance between top two classes
+    top_two = sorted([smooth, featured, artifact], reverse=True)
+    if top_two[0] - top_two[1] < min_confidence:
+        return 'other'
+
+    # Rule-based decision tree
+    if artifact > t_main:
+        return 'other'
+    if smooth > t_main:
+        return 'elliptical'
+    if featured > t_main:
+        if edge_on > t_main:
+            return 'spiral'
+        if bar_total > t_main:
+            return 'barred spiral'
+        if spiral > t_main:
+            return 'spiral'
+        return 'other'
+    return 'other'
+
+# ----------------------------------------------------------------
+# MODEL COLUMNS
+# These correspond to the 10 predicted Galaxy Zoo vote fractions
+
+TARGET_COLS = [
+    "smooth-or-featured_smooth_fraction",
+    "smooth-or-featured_featured-or-disk_fraction",
+    "smooth-or-featured_artifact_fraction",
+    "how-rounded_round_fraction",
+    "how-rounded_in-between_fraction",
+    "how-rounded_cigar-shaped_fraction",
+    "disk-edge-on_yes_fraction",
+    "bar_strong_fraction",
+    "bar_weak_fraction",
+    "has-spiral-arms_yes_fraction",
+]
+
+# Select best available device
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else
+    "cpu"
+)
+
+# Load trained CNN
+model = GalaxyCNN(len(TARGET_COLS)).to(DEVICE)
+model.load_state_dict(torch.load("/Users/nataliapaunova/MSP/BTR/BTR code/project/best_galaxy_cnn.pt", map_location=DEVICE))
+model.eval()
+
+# -------------------------------------------------------------
+# PLOTS
+# Visualization utilities for analyzing model predictions
+
+def plot_distribution(df, save_path=None):
+    labels = ['elliptical', 'spiral', 'barred spiral', 'other']
+    counts = df['morphology'].value_counts().reindex(labels, fill_value=0)
+    percentages = counts / len(df) * 100
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.bar(labels, percentages, color=['steelblue', 'coral', 'mediumseagreen', 'mediumpurple'])
+    
+    # Add percentage labels
+    for bar, pct in zip(bars, percentages):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f'{pct:.1f}%', ha='center', va='bottom', fontsize=10)
+    
+    ax.set_ylabel('Percentage (%)')
+    ax.set_title('Predicted Morphology Distribution')
+    ax.set_ylim(0, max(percentages) * 1.15)
+    fig.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    plt.show()
+
+
+def plot_fraction_distributions(df, save_path=None):
+    # Histograms of key vote fractions
+    cols = {
+        'Smooth': 'smooth-or-featured_smooth_fraction',
+        'Featured': 'smooth-or-featured_featured-or-disk_fraction',
+        'Bar': 'bar_strong_fraction',
+        'Spiral Arms': 'has-spiral-arms_yes_fraction',
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    axes = axes.flatten()
+
+    for ax, (title, col) in zip(axes, cols.items()):
+        ax.hist(df[col], bins=30, color='steelblue', alpha=0.8, density=True)
+        ax.axvline(df[col].mean(), color='red', linestyle='--', 
+                   label=f'mean = {df[col].mean():.2f}')
+        ax.set_title(title)
+        ax.set_xlabel('Predicted fraction')
+        ax.set_ylabel('Density')
+        ax.legend()
+
+    fig.suptitle('Predicted Fraction Distributions')
+    fig.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    plt.show()
+
+
+def plot_fractions_by_morphology(df, save_path=None):
+    """
+    Boxplots showing how predicted vote fractions vary across predicted classes.
+    Useful for checking internal consistency of the classifier.
+    """
+    labels = ['elliptical', 'spiral', 'barred spiral', 'other']
+    cols = {
+        'Smooth': 'smooth-or-featured_smooth_fraction',
+        'Featured': 'smooth-or-featured_featured-or-disk_fraction',
+        'Bar': 'bar_strong_fraction',
+        'Spiral Arms': 'has-spiral-arms_yes_fraction',
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()
+
+    for ax, (title, col) in zip(axes, cols.items()):
+        data = [df[df['morphology'] == label][col].values for label in labels]
+        ax.boxplot(data, labels=labels)
+        ax.set_title(title)
+        ax.set_ylabel('Predicted fraction')
+        ax.tick_params(axis='x', rotation=15)
+
+    fig.suptitle('Predicted Fractions by Morphology')
+    fig.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    plt.show()
+
+# ----------------------------------------------------------------
+# INFERENCE LOOP
+# Loads TNG images → preprocess → predict → classify → save results
+
+DATA_DIR = "/Users/nataliapaunova/MSP/BTR/BTR code/tng50_vis_images"
+
+image_files = sorted([
+    f for f in os.listdir(DATA_DIR)
+    if f.lower().endswith((".png", ".jpg", ".jpeg"))
+])
+
+print(f"Found {len(image_files)} images")
+
+transform = make_transform()
+
+# ---------
+# VISUALIZATION FUNCTION TO CHECK PREPROCESSING STEPS
+# Saves a 4-panel preview for sanity-checking the pipeline
+
+def visualize_preprocessing(img_path):
+    img_rgb = Image.open(img_path).convert("RGB")
+    
+    # Apply Gaussian noise
+    arr = np.array(img_rgb)
+    _, arr_noisy = gaussian_noise(arr, mean=0, stddev=5, gamma=1)
+    img_noisy = Image.fromarray(arr_noisy)
+    
+    tensor = transform(img_noisy)
+    cnn_input = tensor.squeeze().numpy()
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fname = os.path.basename(img_path)
+    fig.suptitle(fname, fontsize=12)
+
+    axes[0].imshow(img_rgb)
+    axes[0].set_title('Original RGB')
+    axes[0].axis('off')
+
+    axes[1].imshow(img_noisy)
+    axes[1].set_title('With Noise')
+    axes[1].axis('off')
+
+    axes[2].imshow(np.array(img_noisy.convert('L')), cmap='gray')
+    axes[2].set_title('Grayscale')
+    axes[2].axis('off')
+
+    axes[3].imshow(cnn_input, cmap='gray')
+    axes[3].set_title('CNN input (128x128)')
+    axes[3].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(f"preview_{os.path.splitext(fname)[0]}.png", dpi=150)
+    plt.show()
+
+# Preview preprocessing on first 10 images
+for fname in image_files[:10]:
+    img_path = os.path.join(DATA_DIR, fname)
+    visualize_preprocessing(img_path)
+
+# ---------
+# MAIN INFERENCE LOOP
+# Runs model on all images and stores predictions
+
+results = []
+
+with torch.no_grad():
+    for fname in image_files:
+        img_path=os.path.join(DATA_DIR, fname)
+
+        try:
+            img=Image.open(img_path).convert("RGB")
+
+            # Apply Gaussian noise (same as training)
+            arr = np.array(img)
+            _, arr_noisy = gaussian_noise(arr, mean=0, stddev=5, gamma=1)
+            img = Image.fromarray(arr_noisy)
+
+            tensor = transform(img).unsqueeze(0).to(DEVICE)
+            preds=model(tensor).squeeze().cpu().numpy()
+
+            pred_row=dict(zip(TARGET_COLS, preds))
+            morphology=classify_galaxy(pd.Series(pred_row))
+
+            results.append({"filename":fname, "morphology":morphology, **pred_row})
+            print(f"{fname}: {morphology}")
+
+        except Exception as e:
+            print(f"Failed on {fname}: {e}")
+
+# ----------------------------------------------------------------
+# SAVE RESULTS
+
+results_df = pd.DataFrame(results)
+results_df.to_parquet("new_tng50_morphologies.parquet", index=False)
+results_df.to_csv("new_tng50_morphologies.csv", index=False)
+
+print(f"Total classified: {len(results_df)}")
+print(f"Morphology distribution:\n{results_df['morphology'].value_counts()}")
+
+# Generate summary plots
+plot_distribution(results_df, save_path="tng_distribution.png")
+plot_fraction_distributions(results_df, save_path="tng_fractions.png")
+plot_fractions_by_morphology(results_df, save_path="tng_fractions_by_class.png")
