@@ -1,0 +1,129 @@
+import requests
+import numpy as np
+import pandas as pd
+from PIL import Image
+import io
+import time
+import os
+
+# API key for accessing the TNG public API, did not display mine, you must obtain one from the TNG50-1 project
+API_KEY = "api_key"
+
+
+def get_galaxy_image(subhalo_id, size_kpc=17, npix=424, max_retries=3):
+    """
+    Download a stellar-light visualization (vis.png) for a given TNG50-1 subhalo.
+    Automatically retries on 504 Gateway Timeout errors, which are common on the TNG server.
+    """
+    url = (
+        f"https://www.tng-project.org/api/TNG50-1/snapshots/99"
+        f"/subhalos/{subhalo_id}/vis.png"
+        f"?partType=stars"
+        f"&size={size_kpc}"
+        f"&sizeType=kpc"
+        f"&nPixels={npix},{npix}"
+        f"&rotation=face-on"
+    )
+
+    for attempt in range(max_retries):
+        response = requests.get(url, headers={"api-key": API_KEY})
+
+        # Successful download
+        if response.status_code == 200:
+            return Image.open(io.BytesIO(response.content))
+
+        # Retry only on server timeout
+        elif response.status_code == 504:
+            print(f"{subhalo_id}: 504 timeout, retrying ({attempt+1}/{max_retries})...")
+            time.sleep(5)
+
+        # Any other error → stop trying
+        else:
+            print(f"{subhalo_id}: Failed with {response.status_code}")
+            return None
+
+    # All retries failed
+    print(f"{subhalo_id}: gave up after {max_retries} retries")
+    return None
+
+
+def crop_annotations(img_pil):
+    """
+    Remove the TNG annotation borders (color bars, labels, axes).
+    Cropping fractions tuned for TNG vis.png output format.
+    """
+    arr = np.array(img_pil)
+    H, W = arr.shape[:2]
+
+    # Fractions determined empirically from TNG images
+    top    = int(H * 0.08)
+    bottom = int(H * 0.915)
+    left   = int(W * 0.085)
+    right  = int(W * 0.835)
+
+    return Image.fromarray(arr[top:bottom, left:right])
+
+
+# ----------------------------------------------------------------
+# Quick sanity check on 3 galaxies before downloading everything
+# ----------------------------------------------------------------
+
+print("Verifying crop on 3 test galaxies...")
+
+for test_id in [1, 2, 3]:
+    img_raw = get_galaxy_image(test_id)
+    if img_raw:
+        img_clean = crop_annotations(img_raw)
+        img_clean.save(f"verify_{test_id}.png")
+        print(f"Saved verify_{test_id}.png — check this looks clean")
+
+# Pause so the user can visually inspect the test crops
+input("\nCheck the 3 verify images. Press Enter to start full download...")
+
+
+# ----------------------------------------------------------------
+# Full dataset download
+# ----------------------------------------------------------------
+
+# Load list of subhalo IDs to download
+df = pd.read_csv("tng50_morphologies.csv")
+subhalo_ids = df["subhalo_id"].tolist()
+
+# Output directory for cleaned images
+os.makedirs("tng50_vis_images", exist_ok=True)
+
+# Track which images are already downloaded
+completed = set(f.replace(".png", "") for f in os.listdir("tng50_vis_images"))
+
+failed = []
+
+for i, subhalo_id in enumerate(subhalo_ids):
+
+    # Skip already-downloaded images
+    if str(subhalo_id) in completed:
+        continue
+
+    img_raw = get_galaxy_image(subhalo_id=subhalo_id)
+
+    if img_raw is not None:
+        img_clean = crop_annotations(img_raw)
+        img_clean.save(f"tng50_vis_images/{subhalo_id}.png")
+    else:
+        failed.append(subhalo_id)
+
+    # Progress update every 100 images
+    if i % 100 == 0:
+        print(f"Progress: {i}/{len(subhalo_ids)}")
+
+    # Avoid hammering the API
+    time.sleep(5)
+
+# ----------------------------------------------------------------
+# Save failed downloads
+# ----------------------------------------------------------------
+
+print(f"\nDone. Failed: {len(failed)}")
+
+if failed:
+    pd.Series(failed).to_csv("failed_subhalos.csv", index=False)
+    print("Failed IDs saved to failed_subhalos.csv")
